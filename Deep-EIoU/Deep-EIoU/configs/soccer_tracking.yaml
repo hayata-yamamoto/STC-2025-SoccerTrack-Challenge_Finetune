@@ -1,0 +1,40 @@
+# サッカー動画追跡用の最適化設定
+# Soccer Video Tracking Optimized Configuration
+
+# 基本検出パラメータ
+track_high_thresh: 0.6      # 高信頼度検出の閾値
+track_low_thresh: 0.1       # 低信頼度検出の閾値
+new_track_thresh: 0.7       # 新規トラック作成の閾値
+track_buffer: 60            # ロストトラック保持フレーム数
+match_thresh: 0.8           # マッチング閾値
+
+# ReID パラメータ
+with_reid: true             # ReID機能を有効化
+proximity_thresh: 0.5       # 空間的近接性の閾値
+appearance_thresh: 0.25     # 外観類似度の閾値
+
+# サッカー特化パラメータ
+enhanced_reid: true         # 強化ReID機能を有効化
+enable_id_correction: true  # ID修正機能を有効化
+correction_buffer_size: 10  # ID修正用バッファサイズ
+correction_thresh: 0.3      # ID修正判定閾値
+
+# 最大track_id制限（サッカーの選手数を考慮）
+max_track_id: 30           # フィールド上の最大選手数を想定
+
+# 追跡最適化パラメータ
+num_iteration: 2           # アソシエーション繰り返し回数
+init_expand_scale: 0.7     # 初期拡張スケール
+expand_scale_step: 0.1     # 拡張スケールステップ
+
+# フィルタリングパラメータ
+aspect_ratio_thresh: 1.6   # アスペクト比フィルタ
+min_box_area: 100          # 最小検出エリア（サッカー選手を考慮）
+nms_thres: 0.7             # NMS閾値
+
+# 説明
+# この設定はサッカー動画の特徴を考慮して最適化されています：
+# - 激しい動きと密集環境に対応
+# - オクルージョン後のID入れ替わりを最小化
+# - 選手数の制限によるID管理の効率化
+# - 強化されたReID機能による堅牢な追跡

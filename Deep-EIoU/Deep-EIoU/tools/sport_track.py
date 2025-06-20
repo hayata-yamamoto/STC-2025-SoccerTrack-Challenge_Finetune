@@ -52,6 +52,12 @@ def make_parser():
     parser.add_argument('--proximity_thresh', type=float, default=0.5, help='threshold for rejecting low overlap reid matches')
     parser.add_argument('--appearance_thresh', type=float, default=0.25, help='threshold for rejecting low appearance similarity reid matches')
 
+    # サッカー特化パラメータ
+    parser.add_argument('--enhanced_reid', action='store_true', default=True, help='use enhanced ReID for soccer')
+    parser.add_argument('--enable_id_correction', action='store_true', default=True, help='enable ID correction mechanism')
+    parser.add_argument('--correction_buffer_size', type=int, default=10, help='buffer size for ID correction')
+    parser.add_argument('--correction_thresh', type=float, default=0.3, help='threshold for ID correction')
+
     return parser
 
 def write_results(filename, results):
@@ -71,9 +77,9 @@ def image_track(detections, embeddings, sct_output_path, args):
 
     # Tracker
     tracker = Deep_EIoU(args, frame_rate=30)
-    
+
     results = []
-    
+
     num_frames = len(detections)
 
     scale = min(1440/1280, 800/720)
@@ -83,7 +89,7 @@ def image_track(detections, embeddings, sct_output_path, args):
         det /= scale
 
         embs = embeddings[frame_id-1]
-        
+
         if det is not None:
 
             embs = [e[0] for e in embs]
@@ -120,33 +126,33 @@ def image_track(detections, embeddings, sct_output_path, args):
     with open(sct_output_path, 'w') as f:
         f.writelines(results)
     logger.info(f"save SCT results to {sct_output_path}")
-    
+
 def main():
-    
+
     args = make_parser().parse_args()
     data_path = args.root_path
     seq_path =  os.path.join(data_path,'detection/')
     os.makedirs(os.path.join(data_path,'SCT'), exist_ok=True)
-    
+
     seqs = os.listdir(seq_path)
     seqs = [path.replace('.npy','') for path in seqs if path.endswith('.npy')]
     seqs.sort()
-        
+
     for seq in seqs:
-            
+
         logger.info('Processing seq {}'.format(seq))
-        
+
         if not os.path.exists(os.path.join(data_path,'detection/','{}.npy'.format(seq))):
             continue
 
         detections = np.load(os.path.join(data_path,'detection/','{}.npy'.format(seq)),allow_pickle=True)
-        
+
         embeddings = np.load(os.path.join(data_path,'embedding/','{}.npy'.format(seq)),allow_pickle=True)
-            
+
         sct_output_path = os.path.join(data_path,'SCT','{}.txt'.format(seq))
-        
+
         # SCT tracking
         image_track(detections, embeddings, sct_output_path, args)
-            
+
 if __name__ == "__main__":
     main()

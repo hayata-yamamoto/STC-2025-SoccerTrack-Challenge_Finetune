@@ -156,7 +156,7 @@ class STrack(BaseTrack):
         ret = self.tlwh.copy()
         ret[2:] += ret[:2]
         return ret
-    
+
     @property
     def last_tlbr(self):
         ret = self.last_tlwh.copy()
@@ -233,13 +233,24 @@ class Deep_EIoU(object):
         self.proximity_thresh = args.proximity_thresh
         self.appearance_thresh = args.appearance_thresh
 
+        # 最大track_id制限の設定
+        if hasattr(args, 'max_track_id') and args.max_track_id is not None:
+            BaseTrack.set_max_track_id(args.max_track_id)
+
+        # ID修正メカニズム用のパラメータ
+        self.id_correction_enabled = getattr(args, 'enable_id_correction', True)
+        self.correction_buffer_size = getattr(args, 'correction_buffer_size', 10)
+        self.correction_thresh = getattr(args, 'correction_thresh', 0.3)
+        self.track_history = defaultdict(list)  # track_id -> list of features
+        self.appearance_history = defaultdict(list)  # track_id -> list of (frame_id, feature)
+
     def update(self, output_results, embedding):
-        
+
         '''
         output_results : [x1,y1,x2,y2,score] type:ndarray
         embdding : [emb1,emb2,...] dim:512
         '''
-        
+
         self.frame_id += 1
         activated_starcks = []
         refind_stracks = []
@@ -256,7 +267,7 @@ class Deep_EIoU(object):
                 # import pdb;pdb.set_trace()
             else:
                 raise ValueError('Wrong detection size {}'.format(output_results.shape[1]))
-                
+
 
             # Remove bad detections
             lowest_inds = scores > self.track_low_thresh
@@ -267,7 +278,7 @@ class Deep_EIoU(object):
             remain_inds = scores > self.args.track_high_thresh
             dets = bboxes[remain_inds]
             scores_keep = scores[remain_inds]
-            
+
             if self.args.with_reid:
                 embedding = embedding[lowest_inds]
                 features_keep = embedding[remain_inds]
@@ -277,7 +288,7 @@ class Deep_EIoU(object):
             scores = []
             dets = []
             scores_keep = []
-            features_keep = []      
+            features_keep = []
 
         if len(dets) > 0:
             '''Detections'''
@@ -308,14 +319,19 @@ class Deep_EIoU(object):
         expand_scale_step = 0.1
 
         for iteration in range(num_iteration):
-            
+
             cur_expand_scale = init_expand_scale + expand_scale_step*iteration
 
             ious_dists = matching.eiou_distance(strack_pool, detections, cur_expand_scale)
             ious_dists_mask = (ious_dists > self.proximity_thresh)
 
             if self.args.with_reid:
-                emb_dists = matching.embedding_distance(strack_pool, detections) / 2.0
+                # サッカー向けの強化されたReID距離計算を使用
+                use_enhanced_reid = getattr(self.args, 'enhanced_reid', True)
+                if use_enhanced_reid:
+                    emb_dists = matching.enhanced_embedding_distance(strack_pool, detections) / 2.0
+                else:
+                    emb_dists = matching.embedding_distance(strack_pool, detections) / 2.0
                 emb_dists[emb_dists > self.appearance_thresh] = 1.0
                 emb_dists[ious_dists_mask] = 1.0
                 dists = np.minimum(ious_dists, emb_dists)
@@ -333,7 +349,7 @@ class Deep_EIoU(object):
                 else:
                     track.re_activate(det, self.frame_id, new_id=False)
                     refind_stracks.append(track)
-            
+
             strack_pool = [strack_pool[i] for i in u_track if strack_pool[i].state == TrackState.Tracked]
             detections = [detections[i] for i in u_detection]
 
@@ -387,7 +403,11 @@ class Deep_EIoU(object):
         ious_dists_mask = (ious_dists > self.proximity_thresh)
 
         if self.args.with_reid:
-            emb_dists = matching.embedding_distance(unconfirmed, detections) / 2.0
+            use_enhanced_reid = getattr(self.args, 'enhanced_reid', True)
+            if use_enhanced_reid:
+                emb_dists = matching.enhanced_embedding_distance(unconfirmed, detections) / 2.0
+            else:
+                emb_dists = matching.embedding_distance(unconfirmed, detections) / 2.0
             raw_emb_dists = emb_dists.copy()
             emb_dists[emb_dists > self.appearance_thresh] = 1.0
             emb_dists[ious_dists_mask] = 1.0
@@ -427,10 +447,111 @@ class Deep_EIoU(object):
         self.lost_stracks.extend(lost_stracks)
         self.lost_stracks = sub_stracks(self.lost_stracks, self.removed_stracks)
         self.removed_stracks.extend(removed_stracks)
+
+        # 削除されたトラックのIDを再利用可能にする（改善版）
+        all_active_ids = set([t.track_id for t in self.tracked_stracks + self.lost_stracks])
+        for track in removed_stracks:
+            if track.track_id not in all_active_ids:
+                BaseTrack.return_id(track.track_id)
+                # print(f"[DEBUG] Track ID {track.track_id} removed and returned to pool")
+
         self.tracked_stracks, self.lost_stracks = remove_duplicate_stracks(self.tracked_stracks, self.lost_stracks)
+
+        # ID修正メカニズムの実行
+        if self.id_correction_enabled and self.args.with_reid:
+            self.perform_id_correction()
+
         output_stracks = [track for track in self.tracked_stracks]
 
         return output_stracks
+
+    def perform_id_correction(self):
+        """オクルージョン後のID修正を実行"""
+        if len(self.tracked_stracks) < 2:
+            return
+
+        # 外観履歴を更新
+        for track in self.tracked_stracks:
+            if track.smooth_feat is not None:
+                self.appearance_history[track.track_id].append(
+                    (self.frame_id, track.smooth_feat.copy())
+                )
+                # 古い履歴を削除
+                if len(self.appearance_history[track.track_id]) > self.correction_buffer_size:
+                    self.appearance_history[track.track_id].pop(0)
+
+        # ID入れ替わりの検出と修正
+        track_pairs = []
+        for i, track_a in enumerate(self.tracked_stracks):
+            for j, track_b in enumerate(self.tracked_stracks[i+1:], i+1):
+                track_pairs.append((track_a, track_b))
+
+        for track_a, track_b in track_pairs:
+            if self.should_swap_ids(track_a, track_b):
+                # print(f"[ID Correction] Swapping IDs: {track_a.track_id} <-> {track_b.track_id}")
+                self.swap_track_ids(track_a, track_b)
+
+    def should_swap_ids(self, track_a, track_b):
+        """2つのトラックのIDを入れ替えるべきかを判定"""
+        if (track_a.track_id not in self.appearance_history or
+            track_b.track_id not in self.appearance_history):
+            return False
+
+        history_a = self.appearance_history[track_a.track_id]
+        history_b = self.appearance_history[track_b.track_id]
+
+        if len(history_a) < 3 or len(history_b) < 3:
+            return False
+
+        # 最近の特徴量と過去の特徴量を比較
+        recent_feat_a = track_a.smooth_feat
+        recent_feat_b = track_b.smooth_feat
+
+        # track_aの最近の特徴量がtrack_bの過去の特徴量により近いかチェック
+        past_features_a = [feat for _, feat in history_a[:-2]]  # 最近2つを除く
+        past_features_b = [feat for _, feat in history_b[:-2]]
+
+        if len(past_features_a) == 0 or len(past_features_b) == 0:
+            return False
+
+        # コサイン類似度を計算
+        from scipy.spatial.distance import cosine
+
+        # track_aの現在の特徴量 vs track_bの過去の特徴量
+        sim_a_to_past_b = np.mean([1 - cosine(recent_feat_a, feat)
+                                   for feat in past_features_b])
+
+        # track_bの現在の特徴量 vs track_aの過去の特徴量
+        sim_b_to_past_a = np.mean([1 - cosine(recent_feat_b, feat)
+                                   for feat in past_features_a])
+
+        # track_aの現在の特徴量 vs track_aの過去の特徴量
+        sim_a_to_past_a = np.mean([1 - cosine(recent_feat_a, feat)
+                                   for feat in past_features_a])
+
+        # track_bの現在の特徴量 vs track_bの過去の特徴量
+        sim_b_to_past_b = np.mean([1 - cosine(recent_feat_b, feat)
+                                   for feat in past_features_b])
+
+        # 入れ替えるべき条件：
+        # 1. 現在のAが過去のBにより類似している
+        # 2. 現在のBが過去のAにより類似している
+        # 3. 類似度の改善が閾値を超えている
+
+        improvement = (sim_a_to_past_b + sim_b_to_past_a) - (sim_a_to_past_a + sim_b_to_past_b)
+
+        return improvement > self.correction_thresh
+
+    def swap_track_ids(self, track_a, track_b):
+        """2つのトラックのIDを入れ替える"""
+        temp_id = track_a.track_id
+        track_a.track_id = track_b.track_id
+        track_b.track_id = temp_id
+
+        # 履歴も入れ替える
+        temp_history = self.appearance_history[temp_id]
+        self.appearance_history[track_a.track_id] = self.appearance_history[track_b.track_id]
+        self.appearance_history[track_b.track_id] = temp_history
 
 
 def joint_stracks(tlista, tlistb):

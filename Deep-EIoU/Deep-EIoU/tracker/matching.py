@@ -68,7 +68,7 @@ def ious(atlbrs, btlbrs):
     return ious
 
 def expand(tlbr, e):
-    
+
     t,l,b,r = tlbr
     w = r-l
     h = b-t
@@ -211,6 +211,82 @@ def embedding_distance(tracks, detections, metric='cosine'):
     det_features = np.asarray([track.curr_feat for track in detections], dtype=float)
     track_features = np.asarray([track.smooth_feat for track in tracks], dtype=float)
     cost_matrix = np.maximum(0.0, cdist(track_features, det_features, metric))  # / 2.0  # Nomalized features
+    return cost_matrix
+
+
+def enhanced_embedding_distance(tracks, detections, metric='cosine', alpha=0.7):
+    """
+    サッカー向けの強化されたReID距離計算
+    時系列の特徴量履歴も考慮してより堅牢なマッチングを実現
+
+    :param tracks: list[STrack]
+    :param detections: list[BaseTrack]
+    :param metric: 距離メトリック
+    :param alpha: 現在特徴量と履歴特徴量の重み (0-1)
+    :return: cost_matrix np.ndarray
+    """
+    cost_matrix = np.zeros((len(tracks), len(detections)), dtype=float)
+    if cost_matrix.size == 0:
+        return cost_matrix
+
+    det_features = np.asarray([track.curr_feat for track in detections], dtype=float)
+
+    for i, track in enumerate(tracks):
+        # 現在の特徴量による距離
+        current_feat = track.smooth_feat
+        current_dist = cdist([current_feat], det_features, metric)[0]
+
+        # 履歴特徴量による距離（利用可能な場合）
+        if hasattr(track, 'features') and len(track.features) > 1:
+            # 最近の特徴量数個を平均化
+            recent_features = track.features[-min(5, len(track.features)):]
+            avg_historical_feat = np.mean(recent_features, axis=0)
+            historical_dist = cdist([avg_historical_feat], det_features, metric)[0]
+
+            # 現在と履歴の特徴量を組み合わせ
+            combined_dist = alpha * current_dist + (1 - alpha) * historical_dist
+        else:
+            combined_dist = current_dist
+
+        cost_matrix[i, :] = np.maximum(0.0, combined_dist)
+
+    return cost_matrix
+
+
+def temporal_embedding_distance(tracks, detections, metric='cosine', window_size=5):
+    """
+    時系列を考慮したReID距離計算
+
+    :param tracks: list[STrack]
+    :param detections: list[BaseTrack]
+    :param metric: 距離メトリック
+    :param window_size: 時系列ウィンドウサイズ
+    :return: cost_matrix np.ndarray
+    """
+    cost_matrix = np.zeros((len(tracks), len(detections)), dtype=float)
+    if cost_matrix.size == 0:
+        return cost_matrix
+
+    det_features = np.asarray([track.curr_feat for track in detections], dtype=float)
+
+    for i, track in enumerate(tracks):
+        if hasattr(track, 'features') and len(track.features) > 0:
+            # 時系列特徴量を使用した距離計算
+            recent_features = track.features[-min(window_size, len(track.features)):]
+
+            # 各検出に対して最小距離を計算
+            min_distances = []
+            for det_feat in det_features:
+                distances = [cdist([feat], [det_feat], metric)[0][0] for feat in recent_features]
+                min_distances.append(min(distances))
+
+            cost_matrix[i, :] = np.maximum(0.0, min_distances)
+        else:
+            # 履歴がない場合は通常の距離計算
+            current_feat = track.smooth_feat
+            current_dist = cdist([current_feat], det_features, metric)[0]
+            cost_matrix[i, :] = np.maximum(0.0, current_dist)
+
     return cost_matrix
 
 

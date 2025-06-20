@@ -96,6 +96,23 @@ def make_parser():
     parser.add_argument('--proximity_thresh', type=float, default=0.5, help='threshold for rejecting low overlap reid matches')
     parser.add_argument('--appearance_thresh', type=float, default=0.25, help='threshold for rejecting low appearance similarity reid matches')
 
+    # SigLIP2 ReID args
+    parser.add_argument("--use_siglip2", action="store_true", default=True, help="use SigLIP2 for ReID feature extraction")
+    parser.add_argument("--siglip2_model", type=str, default="google/siglip2-base-patch16-224", help="SigLIP2 model name from Hugging Face Hub")
+    parser.add_argument("--siglip2_quantization", action="store_true", default=False, help="use 4-bit quantization for SigLIP2")
+    parser.add_argument("--siglip2_text_prompts", type=str, nargs='+', default=None, help="text prompts for SigLIP2 vision-language matching (optional)")
+    parser.add_argument("--reid_model_name", type=str, default="osnet_x1_0", help="ReID model name (when not using SigLIP2)")
+    parser.add_argument("--reid_model_path", type=str, default="checkpoints/sports_model.pth.tar-60", help="ReID model path (when not using SigLIP2)")
+
+    # サッカー特化パラメータ (from sport_track.py)
+    parser.add_argument('--enhanced_reid', action='store_true', default=False, help='use enhanced ReID for soccer')
+    parser.add_argument('--enable_id_correction', action='store_true', default=False, help='enable ID correction mechanism')
+    parser.add_argument('--correction_buffer_size', type=int, default=10, help='buffer size for ID correction')
+    parser.add_argument('--correction_thresh', type=float, default=0.3, help='threshold for ID correction')
+
+    # CMC (Camera Motion Compensation)
+    parser.add_argument("--cmc-method", default="none", type=str, help="cmc method: files (Vidstab GMC) | sparseOptFlow | orb | ecc | none")
+
     # Modifition Point
     # YOLOv11 args, model weight path, defailt det_conf
     parser.add_argument('--detector', default='npy', choices=['npy', 'yolov11'], help='detector type')
@@ -103,7 +120,7 @@ def make_parser():
     parser.add_argument('--det_conf', type=float, default=0.2, help='confidence threshold for detection')
     return parser
 
-   
+
 
 def get_image_list(path):
     image_names = []
@@ -226,25 +243,25 @@ def imageflow_demo(det_or_pre, extractor, vis_folder, current_time, args):
 
                 timer.tic()
                 det = det_or_pre(frame)  #  return np.ndarray, shape=(N,5)
-                # Since the score output from YOLOX can exceed 1, when using YOLOv11, 
+                # Since the score output from YOLOX can exceed 1, when using YOLOv11,
                 # the score value should be increased accordingly to avoid being filtered out by tracker.update()
-                det = det_conf_inverse_sigmoid(det)  
+                det = det_conf_inverse_sigmoid(det)
                 img_info = {'raw_img': frame}
 
             # YOLOx Detecot
             else:
                 outputs, img_info = det_or_pre.inference(frame, timer)
                 det = None if outputs[0] is None else outputs[0].cpu().numpy() # return np.ndarray, shape=(N,5)
-            
-            
+
+
             if det is not None and len(det):
-                
+
                 scale = min(1440/width, 800/height)
                 # Modifition Point
-                # YOLOv11 does not require 
+                # YOLOv11 does not require
                 if args.detector != 'yolov11':
                     det /= scale
-               
+
                 rows_to_remove = np.any(det[:, 0:4] < 1, axis=1) # remove edge detection
                 det = det[~rows_to_remove]
                 # YOLOv11 detector outputs have 5 columns (x1y1x2y2,score)
@@ -361,12 +378,49 @@ def main(exp, args):
 
         det_or_pre = Predictor(model, exp, trt_file, decoder, args.device, args.fp16)
     current_time = time.localtime()
-    
-    extractor = FeatureExtractor(
-        model_name='osnet_x1_0',
-        model_path = 'checkpoints/sports_model.pth.tar-60',
-        device='cuda'
-    )   
+
+    # Feature extractor initialization with SigLIP2 support
+    if args.use_siglip2:
+        logger.info("Using SigLIP2 for ReID feature extraction...")
+
+        # Set up quantization if requested
+        quantization_config = None
+        if args.siglip2_quantization:
+            try:
+                from transformers import BitsAndBytesConfig
+                quantization_config = BitsAndBytesConfig(load_in_4bit=True)
+                logger.info("Using 4-bit quantization for SigLIP2")
+            except ImportError:
+                logger.warning("BitsAndBytesConfig not available, falling back to standard precision")
+
+        extractor = FeatureExtractor(
+            use_siglip2=True,
+            siglip2_model=args.siglip2_model,
+            text_prompts=args.siglip2_text_prompts,
+            return_image_features=True,  # For ReID, we want image features
+            quantization_config=quantization_config,
+            device=str(args.device),
+            verbose=True
+        )
+        logger.info(f"SigLIP2 model loaded: {args.siglip2_model}")
+
+    else:
+        logger.info("Using traditional ReID model for feature extraction...")
+        extractor = FeatureExtractor(
+            model_name=args.reid_model_name,
+            model_path=args.reid_model_path,
+            device=str(args.device),
+            verbose=True
+        )
+        logger.info(f"ReID model loaded: {args.reid_model_name}")
+
+    # サッカー特化機能のログ出力
+    if args.enhanced_reid:
+        logger.info("Enhanced ReID for soccer enabled")
+    if args.enable_id_correction:
+        logger.info(f"ID correction enabled - buffer size: {args.correction_buffer_size}, threshold: {args.correction_thresh}")
+    if args.cmc_method != "none":
+        logger.info(f"Camera Motion Compensation enabled: {args.cmc_method}")
 
     imageflow_demo(det_or_pre, extractor, vis_folder, current_time, args)
 
