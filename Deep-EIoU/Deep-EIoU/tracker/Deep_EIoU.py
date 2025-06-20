@@ -448,13 +448,6 @@ class Deep_EIoU(object):
         self.lost_stracks = sub_stracks(self.lost_stracks, self.removed_stracks)
         self.removed_stracks.extend(removed_stracks)
 
-        # 削除されたトラックのIDを再利用可能にする（改善版）
-        all_active_ids = set([t.track_id for t in self.tracked_stracks + self.lost_stracks])
-        for track in removed_stracks:
-            if track.track_id not in all_active_ids:
-                BaseTrack.return_id(track.track_id)
-                # print(f"[DEBUG] Track ID {track.track_id} removed and returned to pool")
-
         self.tracked_stracks, self.lost_stracks = remove_duplicate_stracks(self.tracked_stracks, self.lost_stracks)
 
         # ID修正メカニズムの実行

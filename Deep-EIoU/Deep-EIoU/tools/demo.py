@@ -22,6 +22,10 @@ import torchvision.transforms as T
 
 from tracker.yolov11_det import YOLOv11Detector
 
+import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
+import multiprocessing
+
 
 IMAGE_EXT = [".jpg", ".jpeg", ".webp", ".bmp", ".png"]
 
@@ -96,6 +100,12 @@ def make_parser():
     parser.add_argument('--proximity_thresh', type=float, default=0.5, help='threshold for rejecting low overlap reid matches')
     parser.add_argument('--appearance_thresh', type=float, default=0.25, help='threshold for rejecting low appearance similarity reid matches')
 
+    # Modifition Point
+    # YOLOv11 args, model weight path, defailt det_conf
+    parser.add_argument('--detector', default='npy', choices=['npy', 'yolov11'], help='detector type')
+    parser.add_argument('--det_ckpt', default='/home/y_li/workspace3/ultralytics/yolov11-finetune/train/weights/best.pt', help='yolov11 model path')
+    parser.add_argument('--det_conf', type=float, default=0.2, help='confidence threshold for detection')
+
     # SigLIP2 ReID args
     parser.add_argument("--use_siglip2", action="store_true", default=True, help="use SigLIP2 for ReID feature extraction")
     parser.add_argument("--siglip2_model", type=str, default="google/siglip2-base-patch16-224", help="SigLIP2 model name from Hugging Face Hub")
@@ -110,14 +120,17 @@ def make_parser():
     parser.add_argument('--correction_buffer_size', type=int, default=10, help='buffer size for ID correction')
     parser.add_argument('--correction_thresh', type=float, default=0.3, help='threshold for ID correction')
 
+    # Soccer-specific preprocessing arguments
+    parser.add_argument("--enable_soccer_preprocessing", action="store_true", help="Enable soccer-specific frame preprocessing")
+    parser.add_argument("--enhance_contrast", action="store_true", help="Apply CLAHE contrast enhancement")
+    parser.add_argument("--gamma_correction", action="store_true", help="Apply gamma correction for better visibility")
+    parser.add_argument("--denoise", action="store_true", help="Apply bilateral filtering for noise reduction")
+    parser.add_argument("--use_field_roi", action="store_true", help="Focus on field area only")
+    parser.add_argument("--adaptive_detection", action="store_true", help="Enable adaptive detection parameters")
+
     # CMC (Camera Motion Compensation)
     parser.add_argument("--cmc-method", default="none", type=str, help="cmc method: files (Vidstab GMC) | sparseOptFlow | orb | ecc | none")
 
-    # Modifition Point
-    # YOLOv11 args, model weight path, defailt det_conf
-    parser.add_argument('--detector', default='npy', choices=['npy', 'yolov11'], help='detector type')
-    parser.add_argument('--det_ckpt', default='/home/y_li/workspace3/ultralytics/yolov11-finetune/train/weights/best.pt', help='yolov11 model path')
-    parser.add_argument('--det_conf', type=float, default=0.2, help='confidence threshold for detection')
     return parser
 
 
@@ -154,6 +167,72 @@ def write_results(filename, results):
                 line = save_format.format(frame=frame_id, id=track_id, x1=round(x1, 1), y1=round(y1, 1), w=round(w, 1), h=round(h, 1), s=round(score, 2))
                 f.write(line)
     logger.info('save results to {}'.format(filename))
+
+
+def preprocess_soccer_frame(frame, args):
+    """サッカー映像専用の前処理"""
+    processed = frame.copy()
+
+    # 1. 画像品質の向上
+    if hasattr(args, 'enhance_contrast') and args.enhance_contrast:
+        # CLAHE (Contrast Limited Adaptive Histogram Equalization)
+        lab = cv2.cvtColor(processed, cv2.COLOR_BGR2LAB)
+        l, a, b = cv2.split(lab)
+        clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8,8))
+        l = clahe.apply(l)
+        processed = cv2.merge([l, a, b])
+        processed = cv2.cvtColor(processed, cv2.COLOR_LAB2BGR)
+
+    # 2. ガンマ補正（暗い部分を明るく）
+    if hasattr(args, 'gamma_correction') and args.gamma_correction:
+        gamma = 1.2  # 暗い部分を明るく
+        processed = np.power(processed/255.0, gamma) * 255
+        processed = processed.astype(np.uint8)
+
+    # 3. ノイズ除去
+    if hasattr(args, 'denoise') and args.denoise:
+        processed = cv2.bilateralFilter(processed, 9, 75, 75)
+
+    # 4. ROI設定（フィールド部分のみ）
+    if hasattr(args, 'use_field_roi') and args.use_field_roi:
+        # フィールドのマスクを作成（緑色の領域を検出）
+        hsv = cv2.cvtColor(processed, cv2.COLOR_BGR2HSV)
+        # 緑色の範囲（フィールド）
+        lower_green = np.array([40, 40, 40])
+        upper_green = np.array([80, 255, 255])
+        field_mask = cv2.inRange(hsv, lower_green, upper_green)
+
+        # モルフォロジー演算でマスクを改善
+        kernel = np.ones((5,5), np.uint8)
+        field_mask = cv2.morphologyEx(field_mask, cv2.MORPH_CLOSE, kernel)
+        field_mask = cv2.morphologyEx(field_mask, cv2.MORPH_OPEN, kernel)
+
+        # フィールド外を暗くする（完全に黒にせず、少し見えるようにする）
+        field_mask_3ch = cv2.cvtColor(field_mask, cv2.COLOR_GRAY2BGR)
+        field_mask_3ch = field_mask_3ch.astype(np.float32) / 255.0
+        non_field_mask = 1.0 - field_mask_3ch
+        processed = processed.astype(np.float32)
+        processed = processed * field_mask_3ch + processed * non_field_mask * 0.3  # 非フィールド部分を30%の明度に
+        processed = processed.astype(np.uint8)
+
+    return processed
+
+
+def adaptive_detection_params(frame, base_conf=0.2):
+    """フレームの特徴に基づいて検出パラメータを動的調整"""
+    # 画像の明度を計算
+    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+    brightness = np.mean(gray)
+
+    # 明度に基づいて信頼度閾値を調整
+    if brightness < 80:  # 暗い場面
+        conf_thresh = base_conf * 0.8  # 閾値を下げる
+    elif brightness > 180:  # 明るい場面
+        conf_thresh = base_conf * 1.2  # 閾値を上げる
+    else:
+        conf_thresh = base_conf
+
+    return conf_thresh
 
 
 class Predictor(object):
@@ -213,7 +292,7 @@ class Predictor(object):
             outputs = postprocess(
                 outputs, self.num_classes, self.confthre, self.nmsthre
             )
-        return outputs, img_info
+            return outputs, img_info
 
 def imageflow_demo(det_or_pre, extractor, vis_folder, current_time, args):
     cap = cv2.VideoCapture(args.path)
@@ -233,7 +312,7 @@ def imageflow_demo(det_or_pre, extractor, vis_folder, current_time, args):
     frame_id = 0
     results = []
     while True:
-        if frame_id % 30 == 0:
+        if frame_id % 200 == 0:
             logger.info('Processing frame {} ({:.2f} fps)'.format(frame_id, 1. / max(1e-5, timer.average_time)))
         ret_val, frame = cap.read()
         if ret_val:
@@ -307,7 +386,6 @@ def imageflow_demo(det_or_pre, extractor, vis_folder, current_time, args):
         with open(res_file, 'w') as f:
             f.writelines(results)
         logger.info(f"save results to {res_file}")
-
 
 def main(exp, args):
     if not args.experiment_name:
@@ -421,6 +499,20 @@ def main(exp, args):
         logger.info(f"ID correction enabled - buffer size: {args.correction_buffer_size}, threshold: {args.correction_thresh}")
     if args.cmc_method != "none":
         logger.info(f"Camera Motion Compensation enabled: {args.cmc_method}")
+
+    # サッカー映像前処理のログ出力
+    if hasattr(args, 'enable_soccer_preprocessing') and args.enable_soccer_preprocessing:
+        logger.info("Soccer-specific preprocessing enabled:")
+        if hasattr(args, 'enhance_contrast') and args.enhance_contrast:
+            logger.info("  - CLAHE contrast enhancement")
+        if hasattr(args, 'gamma_correction') and args.gamma_correction:
+            logger.info("  - Gamma correction for better visibility")
+        if hasattr(args, 'denoise') and args.denoise:
+            logger.info("  - Bilateral filtering for noise reduction")
+        if hasattr(args, 'use_field_roi') and args.use_field_roi:
+            logger.info("  - Field ROI focusing")
+        if hasattr(args, 'adaptive_detection') and args.adaptive_detection:
+            logger.info("  - Adaptive detection parameters based on lighting")
 
     imageflow_demo(det_or_pre, extractor, vis_folder, current_time, args)
 
