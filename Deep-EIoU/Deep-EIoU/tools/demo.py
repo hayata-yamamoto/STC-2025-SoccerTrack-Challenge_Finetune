@@ -107,7 +107,7 @@ def make_parser():
     parser.add_argument('--det_conf', type=float, default=0.2, help='confidence threshold for detection')
 
     # SigLIP2 ReID args
-    parser.add_argument("--use_siglip2", action="store_true", default=True, help="use SigLIP2 for ReID feature extraction")
+    parser.add_argument("--use_siglip2", action="store_true", default=False, help="use SigLIP2 for ReID feature extraction")
     parser.add_argument("--siglip2_model", type=str, default="google/siglip2-base-patch16-224", help="SigLIP2 model name from Hugging Face Hub")
     parser.add_argument("--siglip2_quantization", action="store_true", default=False, help="use 4-bit quantization for SigLIP2")
     parser.add_argument("--siglip2_text_prompts", type=str, nargs='+', default=None, help="text prompts for SigLIP2 vision-language matching (optional)")
@@ -292,7 +292,7 @@ class Predictor(object):
             outputs = postprocess(
                 outputs, self.num_classes, self.confthre, self.nmsthre
             )
-            return outputs, img_info
+        return outputs, img_info
 
 def imageflow_demo(det_or_pre, extractor, vis_folder, current_time, args):
     cap = cv2.VideoCapture(args.path)
@@ -471,16 +471,29 @@ def main(exp, args):
             except ImportError:
                 logger.warning("BitsAndBytesConfig not available, falling back to standard precision")
 
-        extractor = FeatureExtractor(
-            use_siglip2=True,
-            siglip2_model=args.siglip2_model,
-            text_prompts=args.siglip2_text_prompts,
-            return_image_features=True,  # For ReID, we want image features
-            quantization_config=quantization_config,
-            device=str(args.device),
-            verbose=True
-        )
-        logger.info(f"SigLIP2 model loaded: {args.siglip2_model}")
+        try:
+            extractor = FeatureExtractor(
+                use_siglip2=True,
+                siglip2_model=args.siglip2_model,
+                text_prompts=args.siglip2_text_prompts,
+                return_image_features=True,  # For ReID, we want image features
+                quantization_config=quantization_config,
+                device=str(args.device),
+                verbose=True
+            )
+            logger.info(f"SigLIP2 model loaded successfully: {args.siglip2_model}")
+
+        except Exception as e:
+            logger.error(f"Failed to initialize SigLIP2 model: {e}")
+            logger.info("Falling back to traditional ReID model...")
+            # SigLIP2の初期化に失敗した場合、従来のReIDモデルにフォールバック
+            extractor = FeatureExtractor(
+                model_name=args.reid_model_name,
+                model_path=args.reid_model_path,
+                device=str(args.device),
+                verbose=True
+            )
+            logger.info(f"ReID model loaded as fallback: {args.reid_model_name}")
 
     else:
         logger.info("Using traditional ReID model for feature extraction...")

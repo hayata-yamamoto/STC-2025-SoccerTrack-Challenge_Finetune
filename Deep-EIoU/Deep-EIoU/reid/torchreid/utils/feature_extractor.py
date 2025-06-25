@@ -66,30 +66,92 @@ class FeatureExtractor(object):
         if not SIGLIP2_AVAILABLE:
             raise ImportError("transformers library is required for SigLIP2")
 
-        # プロセッサーとモデルの読み込み
-        self.processor = AutoImageProcessor.from_pretrained(model_name)
+        try:
+            # プロセッサーとモデルの読み込み
+            self.processor = AutoImageProcessor.from_pretrained(model_name)
 
-        model_kwargs = {}
-        if quantization_config:
-            model_kwargs['quantization_config'] = quantization_config
-            # 量子化使用時はデータ型を自動設定
-        else:
-            # 量子化なしの場合は float32 を使用してデータ型の一貫性を保つ
-            model_kwargs['torch_dtype'] = torch.float32
-            if device.startswith('cuda'):
-                model_kwargs['device_map'] = "auto"
+            model_kwargs = {}
 
-        self.model = AutoModel.from_pretrained(model_name, **model_kwargs)
-        self.model.eval()
+            # 量子化設定の処理
+            if quantization_config:
+                model_kwargs['quantization_config'] = quantization_config
+                # 量子化使用時はデータ型を自動設定
+                if verbose:
+                    print("Using quantization for SigLIP2 model")
+            else:
+                # 量子化なしの場合、より互換性の高い設定を使用
+                model_kwargs['torch_dtype'] = torch.float32
 
-        if verbose:
-            print(f'SigLIP2 Model: {model_name}')
-            print(f'- Device: {next(self.model.parameters()).device}')
-            print(f'- Dtype: {next(self.model.parameters()).dtype}')
+                # デバイス設定の改善
+                if device.startswith('cuda') and torch.cuda.is_available():
+                    # CUDAが利用可能な場合のみdevice_mapを設定
+                    try:
+                        model_kwargs['device_map'] = "auto"
+                    except Exception as e:
+                        if verbose:
+                            print(f"Warning: Could not set device_map=auto, falling back to manual device setting: {e}")
+                        # device_mapが失敗した場合は手動でデバイス設定
 
-        self.device = torch.device(device)
-        if not quantization_config:
-            self.model.to(self.device)
+            # より安全なモデル読み込み
+            try:
+                self.model = AutoModel.from_pretrained(
+                    model_name,
+                    **model_kwargs,
+                    trust_remote_code=True,  # リモートコードを信頼
+                    ignore_mismatched_sizes=True  # サイズミスマッチを無視
+                )
+            except Exception as first_error:
+                if verbose:
+                    print(f"First attempt failed: {first_error}")
+                    print("Trying fallback approach...")
+
+                # フォールバック: より基本的な設定で再試行
+                fallback_kwargs = {
+                    'torch_dtype': torch.float32,
+                    'trust_remote_code': True,
+                    'ignore_mismatched_sizes': True
+                }
+
+                try:
+                    self.model = AutoModel.from_pretrained(model_name, **fallback_kwargs)
+                    if verbose:
+                        print("Fallback model loading successful")
+                except Exception as second_error:
+                    # 最後の手段: 最小限の設定で試行
+                    if verbose:
+                        print(f"Second attempt failed: {second_error}")
+                        print("Trying minimal configuration...")
+
+                    self.model = AutoModel.from_pretrained(
+                        model_name,
+                        trust_remote_code=True
+                    )
+
+            self.model.eval()
+
+            if verbose:
+                print(f'SigLIP2 Model: {model_name}')
+                print(f'- Device: {next(self.model.parameters()).device}')
+                print(f'- Dtype: {next(self.model.parameters()).dtype}')
+                print(f'- Model loaded successfully')
+
+            self.device = torch.device(device)
+
+            # 量子化されていない場合のみ手動でデバイス移動
+            if not quantization_config:
+                try:
+                    self.model.to(self.device)
+                except Exception as e:
+                    if verbose:
+                        print(f"Warning: Could not move model to {self.device}: {e}")
+                        print("Model will remain on its current device")
+
+        except Exception as e:
+            print(f"Error initializing SigLIP2 model: {e}")
+            print("Falling back to traditional ReID model...")
+            # SigLIP2の初期化に失敗した場合、フラグを無効にして従来のReIDモデルを使用
+            self.use_siglip2 = False
+            raise RuntimeError(f"Failed to initialize SigLIP2 model: {e}")
 
     def _init_reid_model(self, model_name, model_path, image_size,
                         pixel_mean, pixel_std, pixel_norm, device, verbose):
