@@ -12,6 +12,7 @@ class TrackState(object):
 
 class BaseTrack(object):
     _count = 0
+    _max_track_id = None
 
     track_id = 0
     is_activated = False
@@ -35,7 +36,15 @@ class BaseTrack(object):
     @staticmethod
     def next_id():
         BaseTrack._count += 1
+        # ID上限チェック
+        if BaseTrack._max_track_id is not None and BaseTrack._count > BaseTrack._max_track_id:
+            BaseTrack._count = BaseTrack._max_track_id
         return BaseTrack._count
+
+    @staticmethod
+    def set_max_track_id(max_id):
+        """最大track_id数を設定"""
+        BaseTrack._max_track_id = max_id
 
     def activate(self, *args):
         raise NotImplementedError

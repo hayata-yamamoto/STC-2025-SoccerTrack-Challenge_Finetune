@@ -4,6 +4,8 @@ import pandas as pd
 import random
 import shutil
 import yaml
+from pathlib import Path
+from tqdm import tqdm
 
 def create_data_yaml(output_root, class_names=['player']):
     data = {
@@ -123,11 +125,11 @@ def convert_mot_to_yolo_with_split(
 
 if __name__ == '__main__':
     # A folder containing both video files and their corresponding annotations in MOT format.
-    folder = '/home/y_li/workspace3/STC/Train/'
     # The output root directory where the converted YOLO format dataset will be saved.
-    output_root = "/home/y_li/workspace3/STC/STC_YOLO_finetune_dataset/"
+    folder = "/content/drive/MyDrive/ScoccerChllenge2025/Training Dataset"
+    output_root = Path(__file__).resolve().parent / 'STC_YOLO_finetune_dataset'
 
-    for filename in os.listdir(folder):
+    for filename in tqdm(os.listdir(folder)):
         if filename.endswith('.mp4'):
 
             video_path = os.path.join(folder, filename)
@@ -136,7 +138,7 @@ if __name__ == '__main__':
             convert_mot_to_yolo_with_split(
                 mot_txt_path= mot_txt_path,
                 video_path= video_path,
-                output_root= output_root,
+                output_root= str(output_root),
                 use_id_as_class=False,
                 train_ratio=0.7
             )
@@ -144,12 +146,5 @@ if __name__ == '__main__':
     print(f"Dataset successfully generated at {output_root}.")
 
     # Create data.yaml file
-    create_data_yaml(output_root= output_root, class_names=['player'])
+    create_data_yaml(output_root= str(output_root), class_names=['player'])
     print(f"data.yaml successfully generated at {output_root}.")
-
-
-
-
-
-
-

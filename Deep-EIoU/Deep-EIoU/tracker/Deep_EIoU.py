@@ -8,6 +8,53 @@ from tracker.kalman_filter import KalmanFilter
 from collections import defaultdict
 
 
+class PositionalIDManager:
+    """位置情報に基づくシンプルなID管理"""
+
+    def __init__(self, max_id=22):
+        self.max_id = max_id
+        self.active_ids = set()
+        self.position_history = {}  # id -> [(frame, center_x, center_y, bbox_area), ...]
+        self.occlusion_buffer = {}  # id -> 最後に見えた位置と特徴量
+
+    def estimate_depth_order(self, tracks):
+        """バウンディングボックスのサイズと位置から深度順序を推定"""
+        if len(tracks) <= 1:
+            return tracks
+
+        # Y座標（画面下部）とボックスサイズで深度を推定
+        # より下にいて、より大きいボックス = より手前（カメラに近い）
+        depth_scores = []
+        for track in tracks:
+            center_x, center_y = (track.tlwh[0] + track.tlwh[2]/2, track.tlwh[1] + track.tlwh[3]/2)
+            box_area = track.tlwh[2] * track.tlwh[3]
+
+            # 深度スコア：y座標が大きく、ボックスが大きいほど手前
+            depth_score = center_y * 0.7 + (box_area / 10000) * 0.3
+            depth_scores.append((track, depth_score))
+
+        # 深度順にソート（手前から奥へ）
+        depth_scores.sort(key=lambda x: x[1], reverse=True)
+        return [track for track, _ in depth_scores]
+
+    def predict_position(self, track_id, frames_ahead=1):
+        """位置履歴から次の位置を予測"""
+        if track_id not in self.position_history or len(self.position_history[track_id]) < 2:
+            return None
+
+        history = self.position_history[track_id]
+        recent = history[-2:]  # 最新2フレーム
+
+        # 単純な線形予測
+        dx = recent[1][1] - recent[0][1]  # x方向の変化
+        dy = recent[1][2] - recent[0][2]  # y方向の変化
+
+        pred_x = recent[1][1] + dx * frames_ahead
+        pred_y = recent[1][2] + dy * frames_ahead
+
+        return (pred_x, pred_y)
+
+
 class STrack(BaseTrack):
     shared_kalman = KalmanFilter()
 
@@ -234,8 +281,14 @@ class Deep_EIoU(object):
         self.appearance_thresh = args.appearance_thresh
 
         # 最大track_id制限の設定
-        if hasattr(args, 'max_track_id') and args.max_track_id is not None:
-            BaseTrack.set_max_track_id(args.max_track_id)
+        max_id = getattr(args, 'max_track_id', 22)
+        BaseTrack.set_max_track_id(max_id)
+
+        # シンプルな位置ベースID管理
+        self.pos_id_manager = PositionalIDManager(max_id)
+        self.enable_position_tracking = getattr(args, 'enable_position_tracking', True)
+        self.position_weight = getattr(args, 'position_weight', 0.7)
+        self.occlusion_recovery_frames = getattr(args, 'occlusion_recovery_frames', 30)
 
         # ID修正メカニズム用のパラメータ
         self.id_correction_enabled = getattr(args, 'enable_id_correction', True)
@@ -425,13 +478,51 @@ class Deep_EIoU(object):
             removed_stracks.append(track)
 
         """ Step 4: Init new stracks"""
-        for inew in u_detection:
-            track = detections[inew]
-            if track.score < self.new_track_thresh:
-                continue
+        # 位置ベース管理：新規検出に対するスマートID割り当て
+        unmatched_detections = [detections[i] for i in u_detection]
+        print(f"[DEBUG] Step 4: enable_position_tracking={self.enable_position_tracking}, unmatched_detections={len(unmatched_detections)}")
 
-            track.activate(self.kalman_filter, self.frame_id)
-            activated_starcks.append(track)
+        if self.enable_position_tracking and unmatched_detections:
+            print(f"[DEBUG] Using position-based tracking for {len(unmatched_detections)} detections")
+            for detection in unmatched_detections:
+                if detection.score < self.new_track_thresh:
+                    continue
+
+                det_center = (detection.tlwh[0] + detection.tlwh[2]/2,
+                             detection.tlwh[1] + detection.tlwh[3]/2)
+                print(f"[DEBUG] Processing detection at center ({det_center[0]:.1f}, {det_center[1]:.1f})")
+
+                # オクルージョンからの復帰をチェック
+                recovered_id = self.check_occlusion_recovery(detection, det_center)
+
+                if recovered_id:
+                    # 既存IDを再利用
+                    print(f"[DEBUG] Reusing recovered ID: {recovered_id}")
+                    detection.track_id = recovered_id
+                    detection.activate(self.kalman_filter, self.frame_id)
+                    activated_starcks.append(detection)
+                else:
+                    # 新規ID割り当て（上限チェック付き）
+                    new_id = self.assign_new_id_with_limit()
+                    if new_id:
+                        print(f"[DEBUG] Creating new track with ID: {new_id}")
+                        # 一時的にtrack_idを設定してからactivate
+                        BaseTrack._count = new_id - 1  # activateでnext_id()が呼ばれるため
+                        detection.activate(self.kalman_filter, self.frame_id)
+                        activated_starcks.append(detection)
+                    else:
+                        print(f"[DEBUG] Failed to assign new ID - skipping detection")
+        else:
+            # 従来の方法
+            print(f"[DEBUG] Using traditional tracking for {len(u_detection)} detections")
+            for inew in u_detection:
+                track = detections[inew]
+                if track.score < self.new_track_thresh:
+                    continue
+
+                print(f"[DEBUG] Creating track with traditional method, ID will be: {BaseTrack._count + 1}")
+                track.activate(self.kalman_filter, self.frame_id)
+                activated_starcks.append(track)
 
         """ Step 5: Update state"""
         for track in self.lost_stracks:
@@ -449,6 +540,30 @@ class Deep_EIoU(object):
         self.removed_stracks.extend(removed_stracks)
 
         self.tracked_stracks, self.lost_stracks = remove_duplicate_stracks(self.tracked_stracks, self.lost_stracks)
+
+        # 位置ベース管理の実行
+        if self.enable_position_tracking:
+            print(f"[DEBUG] Frame {self.frame_id}: Running position-based management")
+            print(f"[DEBUG] Current tracked tracks: {len(self.tracked_stracks)}, lost tracks: {len(self.lost_stracks)}")
+
+            # 位置履歴を更新
+            self.update_position_history()
+
+            # オクルージョン処理
+            self.handle_occlusions()
+
+            # 現在のIDの状況を表示
+            current_ids = [t.track_id for t in self.tracked_stracks]
+            print(f"[DEBUG] Current track IDs: {sorted(current_ids)}")
+            print(f"[DEBUG] Active IDs in manager: {sorted(self.pos_id_manager.active_ids)}")
+            print(f"[DEBUG] Occlusion buffer: {list(self.pos_id_manager.occlusion_buffer.keys())}")
+
+            # ID上限チェック
+            max_current_id = max(current_ids) if current_ids else 0
+            if max_current_id > self.pos_id_manager.max_id:
+                print(f"[WARNING] ID {max_current_id} exceeds limit {self.pos_id_manager.max_id}!")
+        else:
+            print(f"[DEBUG] Position-based management is disabled")
 
         # ID修正メカニズムの実行
         if self.id_correction_enabled and self.args.with_reid:
@@ -545,6 +660,156 @@ class Deep_EIoU(object):
         temp_history = self.appearance_history[temp_id]
         self.appearance_history[track_a.track_id] = self.appearance_history[track_b.track_id]
         self.appearance_history[track_b.track_id] = temp_history
+
+    def check_occlusion_recovery(self, detection, det_center):
+        """オクルージョンからの復帰をチェック"""
+        best_match_id = None
+        best_score = 0
+
+        print(f"[DEBUG] Checking occlusion recovery. Buffer size: {len(self.pos_id_manager.occlusion_buffer)}")
+
+        for track_id, buffer_data in self.pos_id_manager.occlusion_buffer.items():
+            if track_id in self.pos_id_manager.active_ids:
+                continue
+
+            last_pos, last_feature, last_frame = buffer_data
+
+            # 1. 位置的近さをチェック
+            pos_distance = np.sqrt((det_center[0] - last_pos[0])**2 +
+                                 (det_center[1] - last_pos[1])**2)
+
+            # 2. 予測位置との近さをチェック
+            frames_gap = self.frame_id - last_frame
+            predicted_pos = self.pos_id_manager.predict_position(track_id, frames_gap)
+
+            if predicted_pos:
+                pred_distance = np.sqrt((det_center[0] - predicted_pos[0])**2 +
+                                      (det_center[1] - predicted_pos[1])**2)
+                pos_score = max(0, 1 - pred_distance / 200)  # 200ピクセル以内で高スコア
+            else:
+                pos_score = max(0, 1 - pos_distance / 150)
+
+            # 3. 特徴量の類似度（利用可能な場合）
+            if detection.curr_feat is not None and last_feature is not None:
+                from scipy.spatial.distance import cosine
+                feature_sim = 1 - cosine(detection.curr_feat, last_feature)
+                feature_score = max(0, feature_sim)
+            else:
+                feature_score = 0.5  # デフォルトスコア
+
+            # 4. 総合スコア（位置を重視）
+            total_score = pos_score * self.position_weight + feature_score * (1 - self.position_weight)
+
+            print(f"[DEBUG] Track {track_id}: pos_score={pos_score:.3f}, feature_score={feature_score:.3f}, total_score={total_score:.3f}")
+
+            if total_score > best_score and total_score > 0.6:  # 閾値
+                best_score = total_score
+                best_match_id = track_id
+
+        if best_match_id:
+            print(f"[DEBUG] ID Recovery: {best_match_id} with score {best_score:.3f}")
+        else:
+            print(f"[DEBUG] No ID recovery found")
+
+        return best_match_id
+
+    def assign_new_id_with_limit(self):
+        """上限付きの新規ID割り当て"""
+        print(f"[DEBUG] Assigning new ID. Active IDs: {len(self.pos_id_manager.active_ids)}, Max: {self.pos_id_manager.max_id}")
+        print(f"[DEBUG] Current active IDs: {sorted(self.pos_id_manager.active_ids)}")
+
+        # 使用可能なIDを探す
+        for candidate_id in range(1, self.pos_id_manager.max_id + 1):
+            if candidate_id not in self.pos_id_manager.active_ids:
+                self.pos_id_manager.active_ids.add(candidate_id)
+                print(f"[DEBUG] Assigned new ID: {candidate_id}")
+                return candidate_id
+
+        # IDが不足している場合、最も古い・低品質なトラックを削除
+        print(f"[DEBUG] ID limit reached! Attempting to recycle...")
+        return self.recycle_id_from_low_quality_track()
+
+    def recycle_id_from_low_quality_track(self):
+        """低品質なトラックからIDを回収"""
+        if not self.tracked_stracks and not self.lost_stracks:
+            print(f"[DEBUG] No tracks to recycle from")
+            return None
+
+        # 候補：短時間・低スコア・動きが少ないトラック
+        candidates = []
+        for track in self.tracked_stracks + self.lost_stracks:
+            quality_score = (track.tracklet_len * 0.4 +
+                           track.score * 0.4 +
+                           (self.frame_id - track.start_frame) * 0.2)
+            candidates.append((track, quality_score))
+
+        if candidates:
+            # 最低品質のトラックを削除
+            worst_track, quality = min(candidates, key=lambda x: x[1])
+            recycled_id = worst_track.track_id
+
+            print(f"[DEBUG] Recycling ID {recycled_id} from track with quality {quality:.3f}")
+
+            # トラックを削除
+            if worst_track in self.tracked_stracks:
+                self.tracked_stracks.remove(worst_track)
+            if worst_track in self.lost_stracks:
+                self.lost_stracks.remove(worst_track)
+
+            self.pos_id_manager.active_ids.discard(recycled_id)
+            return recycled_id
+
+        print(f"[DEBUG] No candidates found for recycling")
+        return None
+
+    def update_position_history(self):
+        """位置履歴を更新"""
+        for track in self.tracked_stracks:
+            center_x = track.tlwh[0] + track.tlwh[2] / 2
+            center_y = track.tlwh[1] + track.tlwh[3] / 2
+            box_area = track.tlwh[2] * track.tlwh[3]
+
+            if track.track_id not in self.pos_id_manager.position_history:
+                self.pos_id_manager.position_history[track.track_id] = []
+
+            self.pos_id_manager.position_history[track.track_id].append(
+                (self.frame_id, center_x, center_y, box_area)
+            )
+
+            # 履歴の長さを制限
+            if len(self.pos_id_manager.position_history[track.track_id]) > 30:
+                self.pos_id_manager.position_history[track.track_id].pop(0)
+
+            # アクティブIDを更新
+            self.pos_id_manager.active_ids.add(track.track_id)
+
+    def handle_occlusions(self):
+        """オクルージョンの処理"""
+        # 消失したトラックをバッファに保存
+        for track in self.lost_stracks:
+            if track.track_id not in self.pos_id_manager.occlusion_buffer:
+                center_x = track.last_tlwh[0] + track.last_tlwh[2] / 2
+                center_y = track.last_tlwh[1] + track.last_tlwh[3] / 2
+
+                print(f"[DEBUG] Adding track {track.track_id} to occlusion buffer at position ({center_x:.1f}, {center_y:.1f})")
+
+                self.pos_id_manager.occlusion_buffer[track.track_id] = (
+                    (center_x, center_y),
+                    track.smooth_feat.copy() if track.smooth_feat is not None else None,
+                    track.frame_id
+                )
+
+        # 古いバッファを削除
+        current_frame = self.frame_id
+        expired_ids = []
+        for track_id, (_, _, last_frame) in self.pos_id_manager.occlusion_buffer.items():
+            if current_frame - last_frame > self.occlusion_recovery_frames:
+                expired_ids.append(track_id)
+
+        for track_id in expired_ids:
+            print(f"[DEBUG] Removing expired track {track_id} from occlusion buffer")
+            del self.pos_id_manager.occlusion_buffer[track_id]
+            self.pos_id_manager.active_ids.discard(track_id)
 
 
 def joint_stracks(tlista, tlistb):

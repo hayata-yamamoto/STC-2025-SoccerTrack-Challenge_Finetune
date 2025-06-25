@@ -100,23 +100,22 @@ def make_parser():
     parser.add_argument('--proximity_thresh', type=float, default=0.5, help='threshold for rejecting low overlap reid matches')
     parser.add_argument('--appearance_thresh', type=float, default=0.25, help='threshold for rejecting low appearance similarity reid matches')
 
+    # シンプルな位置ベースID管理
+    parser.add_argument('--max_track_id', type=int, default=22, help='maximum number of track IDs')
+    parser.add_argument('--enable_position_tracking', action='store_true', default=True, help='enable position-based ID management')
+    parser.add_argument('--occlusion_recovery_frames', type=int, default=30, help='frames to keep occlusion buffer')
+    parser.add_argument('--position_weight', type=float, default=0.7, help='weight for position in ID recovery (0.0-1.0)')
+
     # Modifition Point
     # YOLOv11 args, model weight path, defailt det_conf
     parser.add_argument('--detector', default='npy', choices=['npy', 'yolov11'], help='detector type')
     parser.add_argument('--det_ckpt', default='/home/y_li/workspace3/ultralytics/yolov11-finetune/train/weights/best.pt', help='yolov11 model path')
     parser.add_argument('--det_conf', type=float, default=0.2, help='confidence threshold for detection')
 
-    # SigLIP2 ReID args
-    parser.add_argument("--use_siglip2", action="store_true", default=False, help="use SigLIP2 for ReID feature extraction")
-    parser.add_argument("--siglip2_model", type=str, default="google/siglip2-base-patch16-224", help="SigLIP2 model name from Hugging Face Hub")
-    parser.add_argument("--siglip2_quantization", action="store_true", default=False, help="use 4-bit quantization for SigLIP2")
-    parser.add_argument("--siglip2_text_prompts", type=str, nargs='+', default=None, help="text prompts for SigLIP2 vision-language matching (optional)")
-    parser.add_argument("--reid_model_name", type=str, default="osnet_x1_0", help="ReID model name (when not using SigLIP2)")
-    parser.add_argument("--reid_model_path", type=str, default="checkpoints/sports_model.pth.tar-60", help="ReID model path (when not using SigLIP2)")
+    parser.add_argument("--reid_model_name", type=str, default="osnet_x1_0", help="ReID model name")
+    parser.add_argument("--reid_model_path", type=str, default="checkpoints/sports_model.pth.tar-60", help="ReID model path")
 
     # サッカー特化パラメータ (from sport_track.py)
-    parser.add_argument('--enhanced_reid', action='store_true', default=False, help='use enhanced ReID for soccer')
-    parser.add_argument('--enable_id_correction', action='store_true', default=False, help='enable ID correction mechanism')
     parser.add_argument('--correction_buffer_size', type=int, default=10, help='buffer size for ID correction')
     parser.add_argument('--correction_thresh', type=float, default=0.3, help='threshold for ID correction')
 
@@ -127,9 +126,6 @@ def make_parser():
     parser.add_argument("--denoise", action="store_true", help="Apply bilateral filtering for noise reduction")
     parser.add_argument("--use_field_roi", action="store_true", help="Focus on field area only")
     parser.add_argument("--adaptive_detection", action="store_true", help="Enable adaptive detection parameters")
-
-    # CMC (Camera Motion Compensation)
-    parser.add_argument("--cmc-method", default="none", type=str, help="cmc method: files (Vidstab GMC) | sparseOptFlow | orb | ecc | none")
 
     return parser
 
@@ -207,12 +203,11 @@ def preprocess_soccer_frame(frame, args):
         field_mask = cv2.morphologyEx(field_mask, cv2.MORPH_CLOSE, kernel)
         field_mask = cv2.morphologyEx(field_mask, cv2.MORPH_OPEN, kernel)
 
-        # フィールド外を暗くする（完全に黒にせず、少し見えるようにする）
+        # フィールド外を完全に黒にする
         field_mask_3ch = cv2.cvtColor(field_mask, cv2.COLOR_GRAY2BGR)
         field_mask_3ch = field_mask_3ch.astype(np.float32) / 255.0
-        non_field_mask = 1.0 - field_mask_3ch
         processed = processed.astype(np.float32)
-        processed = processed * field_mask_3ch + processed * non_field_mask * 0.3  # 非フィールド部分を30%の明度に
+        processed = processed * field_mask_3ch  # フィールド部分のみ残し、非フィールド部分は0（黒）にする
         processed = processed.astype(np.uint8)
 
     return processed
@@ -316,6 +311,18 @@ def imageflow_demo(det_or_pre, extractor, vis_folder, current_time, args):
             logger.info('Processing frame {} ({:.2f} fps)'.format(frame_id, 1. / max(1e-5, timer.average_time)))
         ret_val, frame = cap.read()
         if ret_val:
+            # Apply soccer-specific preprocessing if enabled
+            if hasattr(args, 'enable_soccer_preprocessing') and args.enable_soccer_preprocessing:
+                frame = preprocess_soccer_frame(frame, args)
+
+            # Apply adaptive detection parameters if enabled
+            if hasattr(args, 'adaptive_detection') and args.adaptive_detection:
+                adaptive_conf = adaptive_detection_params(frame, args.det_conf if args.detector == 'yolov11' else exp.test_conf)
+                if args.detector == 'yolov11':
+                    det_or_pre.conf = adaptive_conf
+                else:
+                    exp.test_conf = adaptive_conf
+
              # Modifition Point
              # YOLOv11 Detector
             if args.detector == 'yolov11':
@@ -457,61 +464,15 @@ def main(exp, args):
         det_or_pre = Predictor(model, exp, trt_file, decoder, args.device, args.fp16)
     current_time = time.localtime()
 
-    # Feature extractor initialization with SigLIP2 support
-    if args.use_siglip2:
-        logger.info("Using SigLIP2 for ReID feature extraction...")
-
-        # Set up quantization if requested
-        quantization_config = None
-        if args.siglip2_quantization:
-            try:
-                from transformers import BitsAndBytesConfig
-                quantization_config = BitsAndBytesConfig(load_in_4bit=True)
-                logger.info("Using 4-bit quantization for SigLIP2")
-            except ImportError:
-                logger.warning("BitsAndBytesConfig not available, falling back to standard precision")
-
-        try:
-            extractor = FeatureExtractor(
-                use_siglip2=True,
-                siglip2_model=args.siglip2_model,
-                text_prompts=args.siglip2_text_prompts,
-                return_image_features=True,  # For ReID, we want image features
-                quantization_config=quantization_config,
-                device=str(args.device),
-                verbose=True
-            )
-            logger.info(f"SigLIP2 model loaded successfully: {args.siglip2_model}")
-
-        except Exception as e:
-            logger.error(f"Failed to initialize SigLIP2 model: {e}")
-            logger.info("Falling back to traditional ReID model...")
-            # SigLIP2の初期化に失敗した場合、従来のReIDモデルにフォールバック
-            extractor = FeatureExtractor(
-                model_name=args.reid_model_name,
-                model_path=args.reid_model_path,
-                device=str(args.device),
-                verbose=True
-            )
-            logger.info(f"ReID model loaded as fallback: {args.reid_model_name}")
-
-    else:
-        logger.info("Using traditional ReID model for feature extraction...")
-        extractor = FeatureExtractor(
-            model_name=args.reid_model_name,
-            model_path=args.reid_model_path,
-            device=str(args.device),
-            verbose=True
-        )
-        logger.info(f"ReID model loaded: {args.reid_model_name}")
-
-    # サッカー特化機能のログ出力
-    if args.enhanced_reid:
-        logger.info("Enhanced ReID for soccer enabled")
-    if args.enable_id_correction:
-        logger.info(f"ID correction enabled - buffer size: {args.correction_buffer_size}, threshold: {args.correction_thresh}")
-    if args.cmc_method != "none":
-        logger.info(f"Camera Motion Compensation enabled: {args.cmc_method}")
+    # Feature extractor initialization
+    logger.info("Using ReID model for feature extraction...")
+    extractor = FeatureExtractor(
+        model_name=args.reid_model_name,
+        model_path=args.reid_model_path,
+        device=str(args.device),
+        verbose=True
+    )
+    logger.info(f"ReID model loaded: {args.reid_model_name}")
 
     # サッカー映像前処理のログ出力
     if hasattr(args, 'enable_soccer_preprocessing') and args.enable_soccer_preprocessing:
